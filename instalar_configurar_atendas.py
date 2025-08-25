@@ -1,16 +1,15 @@
 # ====================== IMPORTS ======================
-import os, sys, time, shutil, tempfile, subprocess
+import os, sys, time, shutil, tempfile, subprocess, re
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import requests
-from pywinauto import Application
+from pywinauto import Application, Desktop
 import pyautogui
 
 # ====================== CONSTANTES ======================
 USUARIO_API_PADRAO = "contatowilliancardoso@gmail.com"   # oculto na UI
 TOKEN_FIXO = "6ddf7ebb-8d57-4d60-b63c-87cfcb853ace"      # oculto na UI
 LISTAR_RAMAIS_URL = "https://novosistema.atendas.com.br/suite/api/listar_ramais?cliente_id=10&pos_registro_inicial=0"
-
 
 SENHA_INICIAL = "Atendas@*2510"
 SERVIDOR_PADRAO = "novosistema.atendas.com.br"
@@ -57,7 +56,21 @@ def conectar_janela_principal():
     janela = app.window(best_match="Atendas")
     return app, janela
 
-# ====================== AÇÕES NA UI DO ATENDAS ======================
+# ====================== SUPORTE (NOVO): VERIFICAÇÃO E SUBSTITUIÇÃO ======================
+def extrair_login_do_titulo(janela):
+    """Se o título for 'Atendas - atendas-1004 Fulano', retorna 'atendas-1004'; senão, None."""
+    try:
+        titulo = (janela.window_text() or "").strip()
+    except Exception:
+        return None
+    m = re.match(r"^Atendas\s*-\s*([^\s]+)", titulo)
+    return m.group(1) if m else None
+
+def verificar_conta_existente(janela):
+    """True/False + login_detectado (ou None)."""
+    login = extrair_login_do_titulo(janela)
+    return (login is not None), login
+
 def abrir_menu_tres_riscos(janela):
     print("📂 Abrindo menu…")
     try:
@@ -89,7 +102,89 @@ def clicar_adicionar_conta(app):
         print(f"⚠️ Não encontrei 'Adicionar Conta…': {e}")
         return False
 
+def clicar_editar_conta(app):
+    print("📝 Selecionando 'Editar Conta…'")
+    try:
+        popup = app.window(control_type="Menu")
+        # várias variantes possíveis
+        for pat in [".*Editar Conta.*", ".*Gerenciar Conta.*", ".*Configurar Conta.*", ".*Conta.*Editar.*"]:
+            try:
+                popup.child_window(title_re=pat, control_type="MenuItem").click_input()
+                time.sleep(0.7)
+                return True
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"⚠️ Não encontrei 'Editar Conta…': {e}")
+    return False
+
+def preencher_qualquer_senha(app, janela, senha=SENHA_INICIAL):
+    """
+    Sempre que um diálogo de senha aparecer, localiza o primeiro campo Edit
+    visível (no popup ou na janela principal) e dá ENTER.
+    """
+    print("🔐 Preenchendo senha…")
+    main_handle = janela.handle
+    proc = app.process
+
+    # 1) tenta nos popups do mesmo processo (exceto a janela principal)
+    tops = Desktop(backend="uia").windows(process=proc)
+    for w in tops:
+        if not w.is_visible() or w.handle == main_handle:
+            continue
+        try:
+            edits = [e for e in w.descendants(control_type="Edit") if e.is_visible()]
+        except Exception:
+            edits = []
+        if edits:
+            try:
+                edt = edits[0]
+                try:
+                    edt.set_text(senha)
+                except Exception:
+                    edt.type_keys("^a{BACKSPACE}", pause=0.02)
+                    edt.type_keys(senha, with_spaces=True, pause=0.02)
+                time.sleep(0.2)
+                try:
+                    w.type_keys("{ENTER}")
+                except Exception:
+                    pyautogui.press("enter")
+                time.sleep(0.8)
+                print("✅ Senha enviada (popup).")
+                return True
+            except Exception:
+                pass
+
+    # 2) tenta na própria janela principal
+    try:
+        edits = [e for e in janela.descendants(control_type="Edit") if e.is_visible()]
+    except Exception:
+        edits = []
+    if edits:
+        try:
+            edt = edits[0]
+            try:
+                edt.set_text(senha)
+            except Exception:
+                edt.type_keys("^a{BACKSPACE}", pause=0.02)
+                edt.type_keys(senha, with_spaces=True, pause=0.02)
+            time.sleep(0.2)
+            try:
+                janela.type_keys("{ENTER}")
+            except Exception:
+                pyautogui.press("enter")
+            time.sleep(0.8)
+            print("✅ Senha enviada (janela).")
+            return True
+        except Exception:
+            pass
+
+    print("⚠️ Não achei campo de senha.")
+    return False
+
 def inserir_senha_inicial_e_enter(janela):
+    """Compatível com seu fluxo original; chama o genérico por baixo."""
+    # Tenta o primeiro Edit visível; se falhar, usa genérico
     print("🔑 Inserindo senha inicial…")
     try:
         caixa = janela.child_window(control_type="Edit", found_index=0)
@@ -99,9 +194,16 @@ def inserir_senha_inicial_e_enter(janela):
         time.sleep(1.0)
         return True
     except:
+        pass
+    # fallback robusto:
+    try:
+        app = Application(backend="uia").connect(path="Atendas.exe")
+        return preencher_qualquer_senha(app, janela, SENHA_INICIAL)
+    except Exception:
         print("⚠️ Não consegui inserir a senha inicial.")
         return False
 
+# ====================== CAMPOS E SALVAR (SEU CÓDIGO ORIGINAL) ======================
 def preencher_campos(janela, cred):
     nome_conta   = cred.get("nome_conta") or cred["login"]
     nome_exib    = cred.get("nome_exibicao") or cred["login"]
@@ -257,13 +359,59 @@ class AppGUI(tk.Tk):
             "proxy_sip": SERVIDOR_PADRAO,
         }
 
-        # Fluxo de instalação + configuração
+        # ========== Fluxo ==========
         if not instalar_atendas_silencioso(): return
         abrir_atendas()
         app, janela = conectar_janela_principal()
+
+        # 1) Verifica se já existe ramal configurado pelo título
+        existe, login_atual = verificar_conta_existente(janela)
+        if existe and login_atual:
+            # pergunta se substitui
+            if not messagebox.askyesno(
+                "Ramal já configurado",
+                f"Já existe um ramal configurado nesta máquina:\n\n"
+                f"• Ramal atual: {login_atual}\n\n"
+                f"Deseja substituir pelos dados selecionados?"
+            ):
+                messagebox.showinfo("Informação", "Operação cancelada. Mantendo o ramal atual.")
+                return
+
+            # ===== SUBSTITUIÇÃO =====
+            # Tenta 'Editar Conta…' direto
+            if abrir_menu_tres_riscos(janela) and clicar_editar_conta(app):
+                # sempre preenche a senha inicial quando solicitado
+                if not preencher_qualquer_senha(app, janela, SENHA_INICIAL): return
+                preencher_campos(janela, cred)
+                if salvar_confirmar(janela):
+                    messagebox.showinfo("Concluído", f"Ramal '{cred['login']}' substituído com sucesso!")
+                return
+
+            # Plano B: abre 'Adicionar Conta…' só pra desbloquear (senha), fecha, e então 'Editar Conta…'
+            if not abrir_menu_tres_riscos(janela): return
+            if not clicar_adicionar_conta(app): return
+            if not preencher_qualquer_senha(app, janela, SENHA_INICIAL): return
+            # fecha o adicionar (ESC) para não criar nova conta
+            try:
+                pyautogui.press("esc")
+                time.sleep(0.5)
+            except Exception:
+                pass
+
+            if not abrir_menu_tres_riscos(janela): return
+            if not clicar_editar_conta(app):
+                messagebox.showerror("Erro", "Não encontrei 'Editar Conta…' no menu.")
+                return
+            if not preencher_qualquer_senha(app, janela, SENHA_INICIAL): return
+            preencher_campos(janela, cred)
+            if salvar_confirmar(janela):
+                messagebox.showinfo("Concluído", f"Ramal '{cred['login']}' substituído com sucesso!")
+            return
+
+        # 2) PRIMEIRA INSTALAÇÃO → seu fluxo original (Adicionar Conta…)
         if not abrir_menu_tres_riscos(janela): return
         if not clicar_adicionar_conta(app): return
-        if not inserir_senha_inicial_e_enter(janela): return
+        if not inserir_senha_inicial_e_enter(janela): return  # usa o genérico em fallback
         preencher_campos(janela, cred)
         if salvar_confirmar(janela):
             messagebox.showinfo("Concluído", f"Ramal '{cred['login']}' configurado com sucesso!")
