@@ -1,10 +1,11 @@
 # ====================== IMPORTS ======================
 import os, sys, time, shutil, tempfile, subprocess, re
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox
 import requests
 from pywinauto import Application, Desktop
 import pyautogui
+import ctypes
 
 # ====================== CONSTANTES ======================
 USUARIO_API_PADRAO = "contatowilliancardoso@gmail.com"   # oculto na UI
@@ -18,82 +19,32 @@ APP_EXEC = r"%LOCALAPPDATA%\Atendas\Atendas.exe"
 BASE_DIR = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(__file__)
 ATENDAS_EXE = os.path.join(BASE_DIR, "Atendas-3.21.6.exe")
 IMG_MENU = os.path.join(BASE_DIR, "imagens_config", "menu_tres_riscos.png")
+LOGO_PNG = os.path.join(BASE_DIR, "imagens_config", "logo-atendas.png")
+
+DARK_BG = "#1F2630"   # cinza-azulado escuro
+FG_TXT  = "#E8EEF7"
+
+# ====================== FECHAR APP (NOVO) ======================
+def finalizar_e_sair(janela_tk, delay_ms=400):
+    """Fecha a janela principal do instalador após um pequeno delay (ms)."""
+    try:
+        janela_tk.after(delay_ms, janela_tk.destroy)
+    except Exception:
+        try:
+            janela_tk.destroy()
+        except Exception:
+            pass
 
 # ====================== API ======================
-def _headers():
-    return {"usuario": USUARIO_API_PADRAO, "token": TOKEN_FIXO, "Accept": "application/json"}
-
-def listar_ramais_api(cliente_id: int, pos_inicio=0):
-    """Busca uma página de ramais para o cliente_id."""
+def listar_ramais_api(usuario_api: str, token: str, cliente_id: int, pos_inicio=0):
+    headers = {"usuario": usuario_api, "token": token, "Accept": "application/json"}
     params = {"cliente_id": int(cliente_id), "pos_registro_inicial": int(pos_inicio)}
-    r = requests.get(LISTAR_RAMAIS_URL, headers=_headers(), params=params, timeout=30)
+    r = requests.get(LISTAR_RAMAIS_URL, headers=headers, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, dict) or "dados" not in data:
         raise RuntimeError(f"JSON inesperado: {str(data)[:400]}")
     return data["dados"]
-
-def listar_ramais_todos(cliente_id: int, max_registros: int = 50000):
-    """Varre todas as páginas até acabar (ou atingir max_registros)."""
-    todos, pos = [], 0
-    while pos < max_registros:
-        try:
-            pagina = listar_ramais_api(cliente_id, pos_inicio=pos)
-        except requests.HTTPError:
-            break
-        if not pagina:
-            break
-        todos.extend(pagina)
-        passo = len(pagina) if len(pagina) > 0 else 100
-        pos += passo
-    return todos
-
-def _get_int(d, *keys):
-    for k in keys:
-        if k in d and d[k] is not None:
-            try:
-                return int(str(d[k]).strip())
-            except Exception:
-                pass
-    return None
-
-def _get_str(d, *keys):
-    for k in keys:
-        if k in d and d[k] is not None:
-            return str(d[k]).strip()
-    return ""
-
-def resolver_codigo_para_ramal(code: str):
-    """
-    Código = clienteID + ramalID (apenas dígitos). Testa TODAS as divisões do código.
-    Para cada cliente_id candidato, pagina TODOS os ramais e procura o ramal_id.
-    Retorna (cliente_id, dict_ramal) se encontrar.
-    """
-    code = (code or "").strip()
-    if not code.isdigit():
-        raise ValueError("O código deve conter apenas números (clienteID + ramalID).")
-
-    for i in range(1, len(code)):
-        cid = int(code[:i])
-        rid = int(code[i:])
-
-        ramais = listar_ramais_todos(cid)
-        if not ramais:
-            continue
-
-        # Tenta id do ramal por diferentes chaves
-        for d in ramais:
-            ramal_id = _get_int(d, "id", "ramal_id", "codigo")
-            if ramal_id is not None and ramal_id == rid:
-                return cid, d
-
-        # Fallback: alguns retornam "numero" como identificador
-        for d in ramais:
-            numero = _get_int(d, "numero")
-            if numero is not None and numero == rid:
-                return cid, d
-
-    raise LookupError("Não encontrei um ramal para este código (clienteID+ramalID).")
 
 # ====================== INSTALAÇÃO / ABERTURA ======================
 def instalar_atendas_silencioso():
@@ -118,13 +69,11 @@ def abrir_atendas():
 
 def conectar_janela_principal():
     app = Application(backend="uia").connect(path="Atendas.exe")
-    # Usa wildcard, pq o título pode ser "Atendas - <login> Nome"
-    janela = app.window(title_re="^Atendas.*")
+    janela = app.window(best_match="Atendas")
     return app, janela
 
-# ====================== SUPORTE: VERIFICAÇÃO/SUBSTITUIÇÃO ======================
+# ====================== SUPORTE: VERIFICAÇÃO / MENU ======================
 def extrair_login_do_titulo(janela):
-    """Se o título for 'Atendas - atendas-1004 Fulano', retorna 'atendas-1004'; senão, None."""
     try:
         titulo = (janela.window_text() or "").strip()
     except Exception:
@@ -138,7 +87,6 @@ def verificar_conta_existente(janela):
 
 def abrir_menu_tres_riscos(janela):
     print("📂 Abrindo menu…")
-    # 1) pywinauto direto (mais rápido)
     try:
         btn = janela.child_window(control_type="Button", found_index=0)
         btn.click_input()
@@ -146,7 +94,6 @@ def abrir_menu_tres_riscos(janela):
         return True
     except:
         pass
-    # 2) fallback por imagem (robusto)
     try:
         pos = pyautogui.locateCenterOnScreen(IMG_MENU, confidence=0.75)
         if pos:
@@ -163,7 +110,7 @@ def clicar_adicionar_conta(app):
     try:
         popup = app.window(control_type="Menu")
         popup.child_window(title_re=".*Adicionar Conta.*", control_type="MenuItem").click_input()
-        time.sleep(0.5)
+        time.sleep(0.6)
         return True
     except Exception as e:
         print(f"⚠️ Não encontrei 'Adicionar Conta…': {e}")
@@ -176,7 +123,7 @@ def clicar_editar_conta(app):
         for pat in [".*Editar Conta.*", ".*Gerenciar Conta.*", ".*Configurar Conta.*", ".*Conta.*Editar.*"]:
             try:
                 popup.child_window(title_re=pat, control_type="MenuItem").click_input()
-                time.sleep(0.5)
+                time.sleep(0.6)
                 return True
             except Exception:
                 continue
@@ -184,16 +131,68 @@ def clicar_editar_conta(app):
         print(f"⚠️ Não encontrei 'Editar Conta…': {e}")
     return False
 
-# ====== SENHA: usa exatamente o padrão que funcionava no seu fluxo ======
+# ====================== SENHA (robusto) ======================
+def preencher_qualquer_senha(app, janela, senha=SENHA_INICIAL):
+    print("🔐 Preenchendo senha…")
+    main_handle = janela.handle
+    proc = app.process
+
+    # 1) popups
+    for w in Desktop(backend="uia").windows(process=proc):
+        if not w.is_visible() or w.handle == main_handle:
+            continue
+        try:
+            edits = [e for e in w.descendants(control_type="Edit") if e.is_visible()]
+        except Exception:
+            edits = []
+        if edits:
+            try:
+                edt = edits[0]
+                try:
+                    edt.set_text(senha)
+                except Exception:
+                    edt.type_keys("^a{BACKSPACE}", pause=0.01)
+                    edt.type_keys(senha, with_spaces=True, pause=0.01)
+                time.sleep(0.15)
+                try:
+                    w.type_keys("{ENTER}")
+                except Exception:
+                    pyautogui.press("enter")
+                time.sleep(0.6)
+                print("✅ Senha enviada (popup).")
+                return True
+            except Exception:
+                pass
+
+    # 2) janela principal
+    try:
+        edits = [e for e in janela.descendants(control_type="Edit") if e.is_visible()]
+    except Exception:
+        edits = []
+    if edits:
+        try:
+            edt = edits[0]
+            try:
+                edt.set_text(senha)
+            except Exception:
+                edt.type_keys("^a{BACKSPACE}", pause=0.01)
+                edt.type_keys(senha, with_spaces=True, pause=0.01)
+            time.sleep(0.15)
+            try:
+                janela.type_keys("{ENTER}")
+            except Exception:
+                pyautogui.press("enter")
+            time.sleep(0.6)
+            print("✅ Senha enviada (janela).")
+            return True
+        except Exception:
+            pass
+
+    print("⚠️ Não achei campo de senha.")
+    return False
+
 def inserir_senha_inicial_e_enter(janela):
-    """
-    Método rápido (o mesmo que estava funcionando antes):
-    - tenta o primeiro Edit visível na janela principal,
-    - se falhar, tenta em popups do mesmo processo,
-    - ENTER no final.
-    """
     print("🔑 Inserindo senha inicial…")
-    # 1) tentar direto na janela principal
     try:
         caixa = janela.child_window(control_type="Edit", found_index=0)
         caixa.set_text(SENHA_INICIAL)
@@ -203,103 +202,15 @@ def inserir_senha_inicial_e_enter(janela):
         return True
     except:
         pass
-    # 2) tentar nos popups (mesmo processo)
     try:
         app = Application(backend="uia").connect(path="Atendas.exe")
-        main_handle = None
-        try:
-            main_handle = janela.handle
-        except Exception:
-            pass
-        for w in Desktop(backend="uia").windows(process=app.process):
-            if not w.is_visible():
-                continue
-            if main_handle and w.handle == main_handle:
-                continue
-            try:
-                edits = [e for e in w.descendants(control_type="Edit") if e.is_visible()]
-            except Exception:
-                edits = []
-            if edits:
-                try:
-                    edt = edits[0]
-                    try:
-                        edt.set_text(SENHA_INICIAL)
-                    except Exception:
-                        edt.type_keys("^a{BACKSPACE}", pause=0.02)
-                        edt.type_keys(SENHA_INICIAL, with_spaces=True, pause=0.02)
-                    time.sleep(0.2)
-                    try:
-                        w.type_keys("{ENTER}")
-                    except Exception:
-                        pyautogui.press("enter")
-                    time.sleep(0.6)
-                    return True
-                except Exception:
-                    continue
+        return preencher_qualquer_senha(app, janela, SENHA_INICIAL)
     except Exception:
-        pass
-    print("⚠️ Não consegui inserir a senha inicial.")
-    return False
+        print("⚠️ Não consegui inserir a senha inicial.")
+        return False
 
 # ====================== CAMPOS / SALVAR ======================
-def _preencher_por_rotulo(janela, rotulo, valor):
-    """Tenta preencher pelo título acessível do campo."""
-    try:
-        campo = janela.child_window(title=rotulo, control_type="Edit")
-        campo.set_text(valor)
-        return True
-    except Exception:
-        return False
-
-def _preencher_por_tab_sequence(janela, valores_seq):
-    """
-    Fallback rápido por ordem de TAB:
-      1 Nome da Conta
-      2 Nome de Exibição
-      3 Usuário
-      4 Login
-      5 Senha
-      6 Servidor SIP
-      7 Proxy SIP
-      8 Domínio
-    Parte do primeiro Edit visível e sai tabulando.
-    """
-    try:
-        edits = [e for e in janela.descendants(control_type="Edit") if e.is_visible()]
-    except Exception:
-        edits = []
-
-    if not edits:
-        return False
-
-    # foca o primeiro e vai preenchendo
-    try:
-        edits[0].set_focus()
-    except Exception:
-        pass
-
-    ordem = valores_seq[:]  # copia
-    for idx, text in enumerate(ordem):
-        # limpa, digita, TAB
-        try:
-            # usar teclado para ser mais compatível
-            pyautogui.hotkey('ctrl', 'a'); time.sleep(0.05)
-            pyautogui.press('backspace'); time.sleep(0.05)
-            if text:
-                pyautogui.typewrite(text, interval=0.01)
-            time.sleep(0.05)
-            if idx < len(ordem) - 1:
-                pyautogui.press('tab'); time.sleep(0.05)
-        except Exception:
-            return False
-    return True
-
 def preencher_campos(janela, cred):
-    """
-    1) Tenta por rótulo (como no seu script base).
-    2) Se algum falhar, usa fallback por TAB sequence (rápido).
-    """
     nome_conta   = cred.get("nome_conta") or cred["login"]
     nome_exib    = cred.get("nome_exibicao") or cred["login"]
     usuario      = cred["login"]
@@ -320,22 +231,18 @@ def preencher_campos(janela, cred):
         (("Domínio","Dominio"),                        dominio),
     ]
     print("✏️ Preenchendo campos…")
-    falhou_algum = False
     for (t1, t2), valor in campos:
-        ok = _preencher_por_rotulo(janela, t1, valor) or _preencher_por_rotulo(janela, t2, valor)
-        if ok:
-            print(f"   • {t1}: OK")
-        else:
-            print(f"   • {t1}: fallback por TAB será usado")
-            falhou_algum = True
-
-    if falhou_algum:
-        print("↪️ Aplicando fallback por ordem de TAB…")
-        seq = [nome_conta, nome_exib, usuario, login_val, senha_val, servidor_sip, proxy_sip, dominio]
-        if _preencher_por_tab_sequence(janela, seq):
-            print("   • Fallback por TAB: OK")
-        else:
-            print("⚠️ Fallback por TAB falhou (verifique o foco/ordem dos campos).")
+        ok = False
+        for t in (t1, t2):
+            try:
+                janela.child_window(title=t, control_type="Edit").set_text(valor)
+                print(f"   • {t}: OK")
+                ok = True
+                break
+            except:
+                continue
+        if not ok:
+            print(f"⚠️ Não consegui preencher '{t1}'")
 
 def salvar_confirmar(janela):
     try:
@@ -351,99 +258,164 @@ def salvar_confirmar(janela):
         print("⚠️ Erro ao salvar/confirmar.")
         return False
 
-# ====================== GUI – POR CÓDIGO ======================
+# ====================== GUI – Instalação por CÓDIGO ======================
 class AppGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Atendas – Instalação por Código (clienteID+ramalID)")
-        self.geometry("560x160")
+
+        # Janela principal
+        self.title("")  # sem texto no título
+        self.configure(bg=DARK_BG)
+        self.geometry("640x320")
         self.resizable(False, False)
 
-        frm = ttk.Frame(self, padding=14)
-        frm.pack(fill="both", expand=True)
+        # ==== Ícone personalizado ====
+        try:
+            icon_path = os.path.join(BASE_DIR, "imagens_config", "ponto.png")
+            if os.path.exists(icon_path):
+                self.iconphoto(False, tk.PhotoImage(file=icon_path))
+        except Exception as e:
+            print(f"⚠️ Não consegui aplicar o ícone: {e}")
 
-        ttk.Label(frm, text="Digite seu código:").grid(row=0, column=0, sticky="w")
-        self.e_code = ttk.Entry(frm, width=28)
-        self.e_code.grid(row=0, column=1, sticky="w", padx=(8, 12))
-        self.e_code.focus_set()
+        # ---- Cabeçalho só com a LOGO ----
+        header = tk.Frame(self, bg=DARK_BG, height=70)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)  # mantém altura
 
-        self.btn_install = ttk.Button(frm, text="Instalar/Configurar", command=self.on_install)
-        self.btn_install.grid(row=1, column=1, sticky="e", pady=(12,0))
+        self.logo_img = None
+        if os.path.exists(LOGO_PNG):
+            try:
+                img = tk.PhotoImage(file=LOGO_PNG)
+                if img.height() > 48:
+                    scale = max(1, img.height() // 48)
+                    img = img.subsample(scale, scale)
+                self.logo_img = img
+                tk.Label(header, image=self.logo_img, bg=DARK_BG).pack(side="left", padx=14, pady=8)
+            except Exception as e:
+                messagebox.showwarning("Logo", f"Falha ao carregar logo:\n{e}")
 
+        # ---- Corpo do formulário ----
+        body = tk.Frame(self, bg=DARK_BG)
+        body.pack(fill="both", expand=True, padx=20, pady=(6, 8))
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Dark.TLabel", background=DARK_BG, foreground=FG_TXT, font=("Segoe UI", 10))
+        style.configure("Dark.TEntry", fieldbackground="#2A3340", foreground=FG_TXT, insertcolor=FG_TXT)
+        style.configure("Dark.TButton", font=("Segoe UI", 10, "bold"))
+
+        ttk.Label(body, text="Digite seu código:", style="Dark.TLabel").grid(row=0, column=0, sticky="e", padx=(0, 10))
+        self.e_codigo = ttk.Entry(body, width=28, style="Dark.TEntry")
+        self.e_codigo.grid(row=0, column=1, sticky="w")
+        self.e_codigo.focus_set()
+
+        self.btn_install = ttk.Button(body, text="Instalar", style="Dark.TButton", command=self.on_install)
+        self.btn_install.grid(row=0, column=2, padx=(16, 0))
+
+    # ---- helpers ----
+    def _parse_codigo(self, s: str):
+        s = (s or "").strip()
+        if not s:
+            return None
+        if "-" in s:
+            a, b = s.split("-", 1)
+        elif "," in s:
+            a, b = s.split(",", 1)
+        elif " " in s:
+            a, b = s.split(None, 1)
+        else:
+            return None
+        try:
+            return int(a), int(b)
+        except:
+            return None
+
+    def _buscar_ramal(self, cliente_id: int, ramal_id: int):
+        dados = listar_ramais_api(USUARIO_API_PADRAO, TOKEN_FIXO, cliente_id, 0)
+        for d in dados:
+            if int(d.get("ramal_id", -1)) == int(ramal_id):
+                return d
+        return None
+
+    # ---- ação principal ----
     def on_install(self):
-        code = (self.e_code.get() or "").strip()
-        if not code:
-            messagebox.showwarning("Atenção", "Informe o código (clienteID + ramalID).")
+        parsed = self._parse_codigo(self.e_codigo.get())
+        if not parsed:
+            messagebox.showwarning("Atenção","Formato inválido.\nExemplo: __-__")
             return
+        cliente_id, ramal_id = parsed
 
         try:
-            cliente_id, d = resolver_codigo_para_ramal(code)
+            d = self._buscar_ramal(cliente_id, ramal_id)
         except Exception as e:
-            messagebox.showerror("Não encontrado", f"Não consegui resolver o código '{code}':\n{e}")
+            messagebox.showerror("Erro na API", f"Não foi possível buscar o ramal:\n{e}")
+            return
+        if not d:
+            messagebox.showwarning("Não encontrado", f"Ramal {ramal_id} não localizado para a unidade {cliente_id}.")
             return
 
-        login = _get_str(d, "usuario_autenticacao", "numero")
+        login = d.get("usuario_autenticacao") or d.get("numero")
         if not login:
-            messagebox.showwarning("Atenção", "Este ramal não possui 'usuario_autenticacao'/'numero'.")
+            messagebox.showwarning("Atenção", "Este ramal não possui 'usuario_autenticacao'.")
             return
-
-        senha = _get_str(d, "senha_sip")
-        if not senha:
-            senha = simpledialog.askstring("Senha do SIP", f"Informe a senha SIP para '{login}':", show="•", parent=self)
-            if not senha:
-                return
+        senha = d.get("senha_sip") or ""
 
         cred = {
             "login": login,
-            "senha": senha,
-            "nome_conta": _get_str(d, "nome") or login,
-            "nome_exibicao": _get_str(d, "nome") or login,
+            "senha": senha if senha else SENHA_INICIAL,
+            "nome_conta": d.get("nome") or login,
+            "nome_exibicao": d.get("nome") or login,
             "dominio": SERVIDOR_PADRAO,
             "servidor_sip": SERVIDOR_PADRAO,
             "proxy_sip": SERVIDOR_PADRAO,
         }
 
-        # ===== Fluxo: instalar/abrir, verificar, substituir ou adicionar =====
+        # ===== Fluxo =====
         if not instalar_atendas_silencioso(): return
         abrir_atendas()
         app, janela = conectar_janela_principal()
 
+        # Verifica se já existe ramal configurado
         existe, login_atual = verificar_conta_existente(janela)
         if existe and login_atual:
             if not messagebox.askyesno(
                 "Ramal já configurado",
-                f"Já existe um ramal nesta máquina:\n\n"
+                f"Já existe um ramal configurado nesta máquina:\n\n"
                 f"• Ramal atual: {login_atual}\n\n"
-                f"Deseja substituir pelos dados selecionados?"
+                f"Deseja substituir por: {login} ?"
             ):
                 messagebox.showinfo("Informação", "Operação cancelada. Mantendo o ramal atual.")
                 return
 
-            # Tentar editar direto
+            # Substituição: Editar Conta…
             if abrir_menu_tres_riscos(janela) and clicar_editar_conta(app):
                 if not inserir_senha_inicial_e_enter(janela): return
                 preencher_campos(janela, cred)
                 if salvar_confirmar(janela):
                     messagebox.showinfo("Concluído", f"Ramal '{cred['login']}' substituído com sucesso!")
-                return
+                    finalizar_e_sair(self)
+                    return
 
-            # Plano B: desbloquear via Adicionar, cancelar, depois Editar
+            # Plano B (se necessário): desbloquear via Adicionar, ESC, depois Editar
             if not abrir_menu_tres_riscos(janela): return
             if not clicar_adicionar_conta(app): return
             if not inserir_senha_inicial_e_enter(janela): return
             try:
-                pyautogui.press("esc"); time.sleep(0.3)
+                pyautogui.press("esc")
+                time.sleep(0.3)
             except Exception:
                 pass
             if not abrir_menu_tres_riscos(janela): return
-            if not clicar_editar_conta(app):
-                messagebox.showerror("Erro", "Não encontrei 'Editar Conta…' no menu.")
-                return
+            if not clicar_editar_conta(app): return
             if not inserir_senha_inicial_e_enter(janela): return
             preencher_campos(janela, cred)
             if salvar_confirmar(janela):
                 messagebox.showinfo("Concluído", f"Ramal '{cred['login']}' substituído com sucesso!")
-            return
+                finalizar_e_sair(self)
+                return
 
         # Primeira instalação
         if not abrir_menu_tres_riscos(janela): return
@@ -452,6 +424,8 @@ class AppGUI(tk.Tk):
         preencher_campos(janela, cred)
         if salvar_confirmar(janela):
             messagebox.showinfo("Concluído", f"Ramal '{cred['login']}' configurado com sucesso!")
+            finalizar_e_sair(self)
+            return
 
 # ====================== MAIN ======================
 if __name__ == "__main__":
